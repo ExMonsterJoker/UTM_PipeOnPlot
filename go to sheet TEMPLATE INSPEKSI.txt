@@ -1,0 +1,155 @@
+go to sheet "TEMPLATE INSPEKSI"
+
+the work area/extraction area
+find cell contain word "REMARKS" in area B to AA and row 2 to 25
+Make sure AA and 25 is adjustable
+make as cell contain word "REMARKS" is as end column and end row for area extraction
+
+then we got extraction area
+1. Inspection Date Finish. E4
+2. Length Of Inspection. Find cell containing word "LENGTH OF INSPECTION" or "LENGTH" in extraction area, then pick cell that has number value at right side. for example "LENGTH OF INSPECTION" is on B9 then check two cell on the right which one is have number value then its the value of length inspection .e.g. C9 or D9
+3. Pipe Material. Find cell containing  word "PIPE MATERIAL" in extraction area, then pick right two row cell for the value, e.g. pipe material in J4 then pick L4 (pipe material cell is merged 2 cell)
+4. NOMINAL THICKNESS (ORIGINAL THICKNESS), Find cell containing  word "NOMINAL THICKNESS (ORIGINAL THICKNESS)" then pick right two row cell for the value, same as above
+5. Operating Pressure, Find cell containing  word PRESSURE then pick right two row cell for the value, e.g. pressure cell containing word in J10 then pick L10
+6. Operating Temperature, Find cell containing  word TEMPERATURE then pick right two row cell for the value, same as above
+7. Service Fluid, Find cell containing  word FLUID then pick right two row cell for the value, same as above
+8. Flange Rating, Find cell containing ANSI, then pick value in that cell. e.g ANSI word detected in cell N9, then pick value in N9
+9. Line ID, Find cell containing LINE then pick right two row cell for the value
+10.NPS, Find cell containing NOMINAL PIPE SIZE then pick right two row cell for the value
+11. Total Joint,         "11. Total Joint": search_for_value(sheet,area,["RAW DATA INPUT"], offset=2)
+
+setup second extraction area (minimum thickness area)
+start column is B (2), ending column is same as column Cell contain "Remarks" above
+Start row is finding cell containing number "1" in column B
+Ending Row is scan column B find cell containing value of from total joint, if found check row below, if cell still contain same value then continue until cell is not same as Total joint.
+(e.g. Total joint value is 30, then find cell contain value 30 in column B, after found it, check row below and check if the cell has same value, if not then pick that cell as ending row)
+
+
+setup third extraction area (Header of minimum thickness area)
+Start column is column B, end column is same column as column Cell contain "Remarks" above.
+start row as row Cell contain "Remarks" above, ending row above row of second extraction area (row second area - 1)
+
+
+Extracting minimum thickness value
+find cell containing "MINIMUM THICKNESS" in area third area, its column is column of thickness value
+row value is same as row value of second extraction area 
+
+find minimum value from all value above
+
+
+on same row as minimum value above, extract column B and C value and concat them e.g. column B = 3, Column C = A, then its become 3A. the name is Joint of minimum Thickness
+
+
+extracting remarks value,
+on same column as column Cell contain "Remarks" above
+and row is same as row value of second extraction area 
+
+i want you to find unique value on that, you can use comma ", " to separate them 
+
+
+Infromation extraction of second sheet
+
+second Sheet = Visual
+
+the header extraction area
+find cell contain word "REMARKS" in area B to AA and row 2 to 25
+Make sure AA and 25 is adjustable
+start row is row of cell remark
+ending row is row of start  row of The data extraction area - 1 (above The data extraction area)
+Start column is column A
+ending column is cell contain word "REMARKS"
+
+The data extraction area
+find cell with value 1 in column A
+find cell with value 
+the start row is row cell with value 1 above
+Ending Row is scan column A find cell containing value of from total joint (from sheet 1 or template inspeksi sheet), if found check row below, if cell still contain same value then continue until cell is not same as Total joint.
+(e.g. Total joint value is 30, then find cell contain value 30 in column B, after found it, check row below and check if the cell has same value, if not then pick that cell as ending row)
+start column is A
+ending column is same column contain word "REMARKS" above (sheet 2)
+
+the information extracted from sheet 2
+
+1. Remarks Visual
+extracting remarks value,
+on same column as column Cell contain "Remarks" above
+and row is same as row value of second extraction area 
+
+i want you to find unique value on that, you can use comma ", " to separate them 
+
+
+2. Above Ground Position
+find cell containing Above Ground in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+3. Lay Down Position
+find cell containing Lay Down in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+4. Under Ground Posiiton
+find cell containing Under Ground in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+5. Painting Condition
+find cell containing Painting in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+i want you to find unique value on that, you can use comma ", " to separate them 
+
+6. Sleeve Condition
+find cell containing Sleeve in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+7. Clamp Condition
+find cell containing Clamp in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+8. Isolation Condition
+find cell containing Isolation in header extraction area, the column is column of above ground data
+the row is is row of data extraction area
+If there is "√" then return value is "√"
+
+
+
+there is two type of excel report that i am gonna extract
+the code is is current type or v1 which has sheet name is "TEMPALTE INSPEKSI"
+
+second type is
+
+has 
+
+SHEET_1_NAME = "UT Data"
+SHEET_2_NAME = "General Visual"
+
+
+change function search_for_value to accept args of additional row
+
+def search_for_value(sheet: Worksheet, area: tuple, keywords: list, offset: int = 0, row_offset: int = 0) -> str:
+    """Searches for a keyword within an area and returns the value from an adjacent cell."""
+    if not area: return "Not Found"
+    start_row, end_row, start_col, end_col = area
+    for row in range(start_row, end_row + 1):
+        for col in range(start_col, end_col + 1):
+            cell = sheet.cell(row=row, column=col)
+            if cell.value and isinstance(cell.value, str):
+                for keyword in keywords:
+                    if keyword.lower() in cell.value.lower():
+                        value_cell = sheet.cell(row=row + row_offset, column=col + offset)
+                        return value_cell.value
+    return "Not Found"
+
+in find area visual change column from A to B if type report is v2 (or sheet name is "UT Data")
+
+in extract_from_template_inspeksi
+
+flange rating become like this         "8. Flange Rating": search_for_value(sheet, header_area, ["ANSI"], row_offset=1), if type report is v2 (or sheet name is "UT Data")
+
+
+i forgot to mention
+
+        "4. Nominal Thickness (mm)": search_for_value(sheet, header_area, ["NOMINAL THICKNESS"], offset=2) if type report is v2 (or sheet name is "UT Data")
+        "4. Nominal Thickness (in)": search_for_value(sheet, header_area, ["NOMINAL THICKNESS"], offset=2, row_offset=1), if type report is v1 (or sheet name is "TEMPALTE INSPEKSI")
