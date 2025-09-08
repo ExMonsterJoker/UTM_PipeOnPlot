@@ -38,6 +38,15 @@ _column_cache = {}
 
 # --- Performance Optimized Helper Functions ---
 
+def get_column_values_batch(sheet: Worksheet, col_idx: int, start_row: int, end_row: int) -> List[Any]:
+    """Reads all cell values in a column range at once for better performance."""
+    if not col_idx or start_row > end_row:
+        return []
+    # Use a list comprehension for a more compact and often faster implementation
+    return [row[0] for row in
+            sheet.iter_rows(min_row=start_row, max_row=end_row, min_col=col_idx, max_col=col_idx, values_only=True)]
+
+
 def get_area_values_batch(sheet: Worksheet, area: Tuple[int, int, int, int]) -> Dict[Tuple[int, int], Any]:
     """Read all cell values in an area at once for better performance."""
     if not area:
@@ -141,7 +150,7 @@ Optional[int]:
 
 def find_check_mark_in_column_optimized(sheet: Worksheet, header_area: Tuple[int, int, int, int],
                                         data_area: Tuple[int, int, int, int], keyword: str) -> str:
-    """Optimized check mark finder."""
+    """Optimized check mark finder that supports normal check symbol and Wingdings 2 'P'."""
     if not header_area or not data_area:
         return "Not Found"
 
@@ -151,11 +160,15 @@ def find_check_mark_in_column_optimized(sheet: Worksheet, header_area: Tuple[int
 
     data_start_row, data_end_row, _, _ = data_area
 
+    # Characters that represent a check mark
+    check_symbols = {"√", "P"}
+
     # Read entire column at once
-    for row in range(data_start_row, data_end_row + 1):
-        cell_val = sheet.cell(row=row, column=target_col).value
-        if cell_val and isinstance(cell_val, str) and "√" in cell_val:
-            return "√"
+    column_values = get_column_values_batch(sheet, target_col, data_start_row, data_end_row)
+
+    for cell_val in column_values:
+        if cell_val and isinstance(cell_val, str) and cell_val.strip() in check_symbols:
+            return "√"  # Always output a normal check mark symbol
 
     return "Not Found"
 
@@ -170,11 +183,31 @@ def extract_unique_values_from_col_optimized(sheet: Worksheet, data_area: Tuple[
     unique_values = set()
 
     # Read entire column at once
-    for row in range(data_start_row, data_end_row + 1):
-        cell_val = sheet.cell(row=row, column=col_idx).value
+    column_values = get_column_values_batch(sheet, col_idx, data_start_row, data_end_row)
+
+    for cell_val in column_values:
         if cell_val and str(cell_val).strip():
             unique_values.add(str(cell_val).strip())
 
+    return ", ".join(sorted(list(unique_values))) if unique_values else "Not Found"
+
+
+def extract_unique_values_from_col_or_notfound(sheet: Worksheet, data_area: Tuple[int, int, int, int],
+                                               col_idx: int) -> str:
+    """
+    Extract unique non-empty values from a column or return 'Not Found' if none.
+    """
+    if not data_area or not col_idx:
+        return "Not Found"
+
+    data_start_row, data_end_row, _, _ = data_area
+    unique_values = set()
+
+    column_values = get_column_values_batch(sheet, col_idx, data_start_row, data_end_row)
+
+    for cell_val in column_values:
+        if cell_val and str(cell_val).strip():
+            unique_values.add(str(cell_val).strip())
     return ", ".join(sorted(list(unique_values))) if unique_values else "Not Found"
 
 
@@ -202,137 +235,157 @@ def find_area_by_remarks_optimized(sheet: Worksheet) -> Optional[Tuple[int, int,
 
 def find_data_area_sheet1_optimized(sheet: Worksheet, end_col_from_first_area: int, total_joint: Any) -> Optional[
     Tuple[int, int, int, int]]:
-    """Optimized data area finder for Sheet 1."""
+    """Modified data area finder for Sheet 1 - uses 'Approval Path' to find end row."""
+
+    # Read column B once to find start and end rows
+    col_b_values = get_column_values_batch(sheet, 2, 1, sheet.max_row)
+
     # Find start row with value '1' in Column B
     start_row = None
-    for r in range(1, min(sheet.max_row + 1, 100)):  # Limit search to first 100 rows
-        if sheet.cell(row=r, column=2).value == 1:
-            start_row = r
+    # Search in first 100 rows, which is a reasonable limit
+    for i, cell_val in enumerate(col_b_values[:min(len(col_b_values), 99)]):
+        if cell_val == 1:
+            start_row = i + 1  # 1-based index
             break
 
     if not start_row:
         logger.error("Could not find start row with value '1' in Column B.")
         return None
 
-    try:
-        total_joint_num = int(total_joint)
-    except (ValueError, TypeError):
-        logger.error(f"'Total Joint' value ('{total_joint}') is not a valid number.")
-        return None
-
-    # Find end row
+    # NEW LOGIC: Scan until 'Approval Path' is found
     end_row = None
-    for r in range(start_row, sheet.max_row + 1):
-        cell_val = sheet.cell(row=r, column=2).value
-
-        try:
-            # Clean up the value if it's a string, then convert to int
-            if isinstance(cell_val, str):
-                current_joint_num = int(cell_val.strip())
-            else:
-                current_joint_num = int(cell_val)
-
-            # Check if the current row's joint number matches the target
-            if current_joint_num == total_joint_num:
-                # It matches. Now, check if the *next* row is different to confirm it's the end.
-                next_cell_val = sheet.cell(row=r + 1, column=2).value
-                is_last_in_sequence = True  # Assume it's the last one
-
-                try:
-                    # Apply the same robust conversion to the next cell's value
-                    if isinstance(next_cell_val, str):
-                        next_joint_num = int(next_cell_val.strip())
-                    else:
-                        next_joint_num = int(next_cell_val)
-
-                    # If the next row has the same joint number, it's not the last one
-                    if next_joint_num == total_joint_num:
-                        is_last_in_sequence = False
-                except (ValueError, TypeError, AttributeError):
-                    # The next cell is not a valid number, so our current row is the last one.
-                    pass
-
-                if is_last_in_sequence:
-                    end_row = r
-                    break  # Found the end row, so we can exit the loop
-
-        except (ValueError, TypeError, AttributeError):
-            # If cell_val is not a number (e.g., text like "JOINT", None, or empty), skip it.
-            continue
+    # Start search from where start_row was found
+    for i, cell_val in enumerate(col_b_values[start_row - 1:]):
+        if isinstance(cell_val, str) and cell_val.strip() == "Approval Path":
+            end_row = start_row + i  # 1-based index
+            break
 
     if not end_row:
-        logger.error(f"Could not find end row matching 'Total Joint' {total_joint_num}.")
+        logger.error("Could not find 'Approval Path' in Column B.")
         return None
 
     return start_row, end_row, 2, end_col_from_first_area
 
 
+def find_total_joint_from_data_area(sheet: Worksheet, start_row: int, end_row: int) -> Any:
+    """Find the biggest number in Column B within the data area range."""
+    max_number = None
+
+    col_b_values = get_column_values_batch(sheet, 2, start_row, end_row)
+
+    for cell_val in col_b_values:
+        if isinstance(cell_val, (int, float)):
+            if max_number is None or cell_val > max_number:
+                max_number = cell_val
+
+    return max_number if max_number is not None else "Not Found"
+
+
 def find_areas_visual_optimized(sheet: Worksheet, total_joint: Any, report_type: str) -> Optional[
     Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
-    """Optimized visual area finder."""
+    """Optimized visual area finder. Special handling for v2 General Visual sheet (no Remarks column)."""
     try:
-        search_end_col_idx = column_index_from_string(SEARCH_REMARKS_END_COL)
-    except Exception:
-        logger.error(f"Invalid column '{SEARCH_REMARKS_END_COL}' in config.")
+        if report_type == "v2" and sheet.title == SHEET_2_NAME_V2:
+            # Fixed column AA as end limit
+            remarks_col_idx = column_index_from_string("AA")
+            logger.info("Using fixed end column AA for v2 General Visual (no Remarks column)")
+
+            # Determine start column for data (v2 → column B)
+            start_col_data = 2
+
+            # Find data start row
+            data_start_row = None
+            col_b_values = get_column_values_batch(sheet, start_col_data, 1, min(sheet.max_row, 100))
+            for i, cell_val in enumerate(col_b_values):
+                if cell_val == 1:
+                    data_start_row = i + 1
+                    break
+            if not data_start_row:
+                logger.error(f"Could not find data start row with value '1' in Column {get_column_letter(start_col_data)}.")
+                return None
+
+            # Ensure total_joint is valid
+            try:
+                total_joint_num = int(total_joint)
+            except (ValueError, TypeError):
+                logger.error(f"'Total Joint' value ('{total_joint}') is not valid.")
+                return None
+
+            # Find data end row
+            data_end_row = None
+            col_b_all_values = get_column_values_batch(sheet, start_col_data, data_start_row, sheet.max_row)
+            for i, cell_val in enumerate(col_b_all_values):
+                if isinstance(cell_val, (int, float)) and int(cell_val) == total_joint_num:
+                    next_cell_val = col_b_all_values[i + 1] if i + 1 < len(col_b_all_values) else None
+                    if next_cell_val is None or not isinstance(next_cell_val, (int, float)) or int(
+                            next_cell_val) != total_joint_num:
+                        data_end_row = data_start_row + i
+                        break
+            if not data_end_row:
+                logger.error(f"Could not find data end row matching 'Total Joint' {total_joint_num}.")
+                return None
+
+            # Build header and data areas
+            header_area = (2, data_start_row - 1, 1, remarks_col_idx)
+            data_area = (data_start_row, data_end_row, start_col_data, remarks_col_idx)
+            return header_area, data_area
+
+        else:
+            # Original v1 logic
+            search_end_col_idx = column_index_from_string(SEARCH_REMARKS_END_COL)
+            search_area = (2, SEARCH_REMARKS_END_ROW, 2, search_end_col_idx)
+            area_values = get_area_values_batch(sheet, search_area)
+
+            remarks_cell_row, remarks_cell_col = None, None
+            for (row, col), value in area_values.items():
+                if value and isinstance(value, str) and "REMARKS".lower() in value.lower():
+                    remarks_cell_row, remarks_cell_col = row, col
+                    break
+
+            if not remarks_cell_row:
+                logger.error("Could not find 'REMARKS' cell in visual sheet.")
+                return None
+
+            start_col_data = 1 if report_type == "v1" else 2
+            data_start_row = None
+            col_start_values = get_column_values_batch(sheet, start_col_data, 1, min(sheet.max_row, 100))
+            for i, cell_val in enumerate(col_start_values):
+                if cell_val == 1:
+                    data_start_row = i + 1
+                    break
+            if not data_start_row:
+                logger.error(f"Could not find data start row with value '1' in Column {get_column_letter(start_col_data)}.")
+                return None
+
+            try:
+                total_joint_num = int(total_joint)
+            except (ValueError, TypeError):
+                logger.error(f"'Total Joint' value ('{total_joint}') is not valid.")
+                return None
+
+            data_end_row = None
+            col_start_all_values = get_column_values_batch(sheet, start_col_data, data_start_row, sheet.max_row)
+            for i, cell_val in enumerate(col_start_all_values):
+                if isinstance(cell_val, (int, float)) and int(cell_val) == total_joint_num:
+                    next_cell_val = col_start_all_values[i + 1] if i + 1 < len(col_start_all_values) else None
+                    if next_cell_val is None or not isinstance(next_cell_val, (int, float)) or int(
+                            next_cell_val) != total_joint_num:
+                        data_end_row = data_start_row + i
+                        break
+            if not data_end_row:
+                logger.error(f"Could not find data end row matching 'Total Joint' {total_joint_num}.")
+                return None
+
+            data_area = (data_start_row, data_end_row, start_col_data, remarks_cell_col)
+            header_area = (remarks_cell_row, data_start_row - 1, 1, remarks_cell_col)
+            if header_area[0] >= header_area[1]:
+                logger.warning("Header area has invalid dimensions.")
+                return None
+            return header_area, data_area
+
+    except Exception as e:
+        logger.error(f"Error in find_areas_visual_optimized: {e}")
         return None
-
-    # Find REMARKS cell
-    search_area = (2, SEARCH_REMARKS_END_ROW, 2, search_end_col_idx)
-    area_values = get_area_values_batch(sheet, search_area)
-
-    remarks_cell_row, remarks_cell_col = None, None
-    for (row, col), value in area_values.items():
-        if value and isinstance(value, str) and "REMARKS".lower() in value.lower():
-            remarks_cell_row, remarks_cell_col = row, col
-            break
-
-    if not remarks_cell_row:
-        logger.error("Could not find 'REMARKS' cell in visual sheet.")
-        return None
-
-    # Determine start column based on report type
-    start_col_data = 1 if report_type == "v1" else 2
-
-    # Find data start row
-    data_start_row = None
-    for r in range(1, min(sheet.max_row + 1, 100)):  # Limit search
-        if sheet.cell(row=r, column=start_col_data).value == 1:
-            data_start_row = r
-            break
-
-    if not data_start_row:
-        logger.error(f"Could not find data start row with value '1' in Column {get_column_letter(start_col_data)}.")
-        return None
-
-    try:
-        total_joint_num = int(total_joint)
-    except (ValueError, TypeError):
-        logger.error(f"'Total Joint' value ('{total_joint}') is not valid.")
-        return None
-
-    # Find data end row
-    data_end_row = None
-    for r in range(data_start_row, sheet.max_row + 1):
-        cell_val = sheet.cell(row=r, column=start_col_data).value
-        if cell_val is not None and isinstance(cell_val, (int, float)) and int(cell_val) == total_joint_num:
-            next_cell_val = sheet.cell(row=r + 1, column=start_col_data).value
-            if next_cell_val is None or not isinstance(next_cell_val, (int, float)) or int(
-                    next_cell_val) != total_joint_num:
-                data_end_row = r
-                break
-
-    if not data_end_row:
-        logger.error(f"Could not find data end row matching 'Total Joint' {total_joint_num}.")
-        return None
-
-    data_area = (data_start_row, data_end_row, start_col_data, remarks_cell_col)
-    header_area = (remarks_cell_row, data_start_row - 1, 1, remarks_cell_col)
-
-    if header_area[0] >= header_area[1]:
-        logger.warning("Header area has invalid dimensions.")
-        return None
-
-    return header_area, data_area
 
 
 def determine_document_version(workbook, sheet1_name=None) -> str:
@@ -373,6 +426,7 @@ def determine_document_version(workbook, sheet1_name=None) -> str:
         logger.warning(f"Error determining document version: {e}")
         return "unknown"
 
+
 # --- Optimized Extraction Functions ---
 
 def extract_min_thickness_and_joint_optimized(sheet: Worksheet, data_area: Tuple[int, int, int, int],
@@ -385,24 +439,30 @@ def extract_min_thickness_and_joint_optimized(sheet: Worksheet, data_area: Tuple
     if not thickness_col:
         return "Not Found", "Not Found"
 
-    # Read thickness data in batch
+    start_row, end_row, _, _ = data_area
+
+    # Read required columns in batch
+    thickness_vals = get_column_values_batch(sheet, thickness_col, start_row, end_row)
+    col_b_vals = get_column_values_batch(sheet, 2, start_row, end_row)
+    col_c_vals = get_column_values_batch(sheet, 3, start_row, end_row)
+
     min_thickness_data = []
-    for r in range(data_area[0], data_area[1] + 1):
-        cell_val = sheet.cell(row=r, column=thickness_col).value
-        # Only consider numeric values that are strictly greater than 0
+    for i, cell_val in enumerate(thickness_vals):
         if isinstance(cell_val, (int, float)) and cell_val > 0:
-            min_thickness_data.append({'value': cell_val, 'row': r})
+            min_thickness_data.append({'value': cell_val, 'index': i})
 
     if not min_thickness_data:
-        # This will now be triggered if all values are 0, non-numeric, or blank
         return "Not Found", "Not Found"
 
     min_item = min(min_thickness_data, key=lambda x: x['value'])
-    val_b = sheet.cell(row=min_item['row'], column=2).value
-    val_c = sheet.cell(row=min_item['row'], column=3).value
+    row_idx = min_item['index']
+
+    val_b = col_b_vals[row_idx]
+    val_c = col_c_vals[row_idx]
     joint = f"{val_b or ''}{val_c or ''}"
 
     return min_item['value'], joint
+
 
 def extract_max_thickness_and_joint_optimized(sheet: Worksheet, data_area: Tuple[int, int, int, int],
                                               header_area: Tuple[int, int, int, int]) -> Tuple[Any, str]:
@@ -414,22 +474,58 @@ def extract_max_thickness_and_joint_optimized(sheet: Worksheet, data_area: Tuple
     if not thickness_col:
         return "Not Found", "Not Found"
 
-    # Read thickness data in batch
+    start_row, end_row, _, _ = data_area
+
+    # Read required columns in batch
+    thickness_vals = get_column_values_batch(sheet, thickness_col, start_row, end_row)
+    col_b_vals = get_column_values_batch(sheet, 2, start_row, end_row)
+    col_c_vals = get_column_values_batch(sheet, 3, start_row, end_row)
+
     thickness_data = []
-    for r in range(data_area[0], data_area[1] + 1):
-        cell_val = sheet.cell(row=r, column=thickness_col).value
+    for i, cell_val in enumerate(thickness_vals):
         if isinstance(cell_val, (int, float)):
-            thickness_data.append({'value': cell_val, 'row': r})
+            thickness_data.append({'value': cell_val, 'index': i})
 
     if not thickness_data:
         return "Not Found", "Not Found"
 
     max_item = max(thickness_data, key=lambda x: x['value'])
-    val_b = sheet.cell(row=max_item['row'], column=2).value
-    val_c = sheet.cell(row=max_item['row'], column=3).value
+    row_idx = max_item['index']
+
+    val_b = col_b_vals[row_idx]
+    val_c = col_c_vals[row_idx]
     joint = f"{val_b or ''}{val_c or ''}"
 
     return max_item['value'], joint
+
+
+def extract_max_thickness_pipe_joint_optimized(sheet: Worksheet, data_area: Tuple[int, int, int, int],
+                                               header_area: Tuple[int, int, int, int]) -> Any:
+    """
+    Extract maximum thickness only for joints where JOINT TYPES is 'PIPE'.
+    """
+    if not header_area:
+        return "="
+
+    thickness_col = find_column_by_keyword_optimized(sheet, header_area, "MAXIMUM THICKNESS")
+    joint_type_col = find_column_by_keyword_optimized(sheet, header_area, "JOINT TYPES")
+    if not thickness_col or not joint_type_col:
+        return "="
+
+    start_row, end_row, _, _ = data_area
+
+    thickness_vals = get_column_values_batch(sheet, thickness_col, start_row, end_row)
+    joint_type_vals = get_column_values_batch(sheet, joint_type_col, start_row, end_row)
+
+    max_thickness = None
+    for i, joint_type_val in enumerate(joint_type_vals):
+        thickness_val = thickness_vals[i]
+
+        if isinstance(joint_type_val, str) and joint_type_val.strip().upper() == "PIPE":
+            if isinstance(thickness_val, (int, float)):
+                if max_thickness is None or thickness_val > max_thickness:
+                    max_thickness = thickness_val
+    return max_thickness if max_thickness is not None else "="
 
 
 def extract_from_sheet1_optimized(sheet: Worksheet, report_type: str) -> Dict[str, Any]:
@@ -458,25 +554,27 @@ def extract_from_sheet1_optimized(sheet: Worksheet, report_type: str) -> Dict[st
     }
 
     if report_type == "v1":
-        data["Total Joint"] = search_for_value_optimized(sheet, header_area, ["RAW DATA INPUT"], offset=2)
         data["Length Of Inspection (m)"] = search_for_value_optimized(sheet, header_area, ["LENGTH"], offset=2)
         data["Nominal Thickness (in)"] = search_for_value_optimized(sheet, header_area, ["NOMINAL THICKNESS"],
                                                                     offset=2, row_offset=1)
         data["Flange Rating"] = find_value_in_cell_optimized(sheet, header_area, "ANSI")
     elif report_type == "v2":
-        data["Total Joint"] = search_for_value_optimized(sheet, header_area, ["RAW DATA"], offset=2)
         data["Length Of Inspection (m)"] = search_for_value_optimized(sheet, header_area, ["LENGTH"], offset=1)
         data["Nominal Thickness (mm)"] = search_for_value_optimized(sheet, header_area, ["NOMINAL THICKNESS"],
                                                                     offset=2)
         data["Flange Rating"] = search_for_value_optimized(sheet, header_area, ["ANSI"], row_offset=1)
 
     # Process data area
-    total_joint = data.get("Total Joint")
-    data_area = find_data_area_sheet1_optimized(sheet, end_c, total_joint)
+    data_area = find_data_area_sheet1_optimized(sheet, end_c, None)  # Pass None since we don't need it
 
     if data_area:
         logger.info(
             f"Data Area: {get_column_letter(data_area[2])}{data_area[0]}:{get_column_letter(data_area[3])}{data_area[1]}")
+
+        start_row, end_row, start_col, end_col = data_area
+        total_joint_calculated = find_total_joint_from_data_area(sheet, start_row, end_row)
+        data["Total Joint"] = total_joint_calculated
+
         header_area_2 = (end_r, data_area[0] - 1, 2, end_c)
 
         min_thick, min_joint_loc = extract_min_thickness_and_joint_optimized(sheet, data_area, header_area_2)
@@ -486,6 +584,10 @@ def extract_from_sheet1_optimized(sheet: Worksheet, report_type: str) -> Dict[st
         max_thick, max_joint_loc = extract_max_thickness_and_joint_optimized(sheet, data_area, header_area_2)
         data["Maximum Thickness (mm)"] = max_thick
         data["Joint of Maximum Thickness"] = max_joint_loc
+
+        max_thick_pipe = extract_max_thickness_pipe_joint_optimized(sheet, data_area, header_area_2)
+        data["Max Thickness Pipe Joint"] = max_thick_pipe
+
         data["Remarks"] = extract_unique_values_from_col_optimized(sheet, data_area, end_c)
 
     return data
@@ -528,36 +630,44 @@ def calculate_inspection_rate_ratio(sheet, data_area, nps_size):
     # Dictionary to store all ratios for each joint
     joint_ratios = {}
 
-    # Process each row in the data area
-    for row in range(data_area[0], data_area[1] + 1):
-        joint_val = sheet.cell(row=row, column=joint_col).value
+    start_row, end_row, _, _ = data_area
+
+    # Read the entire data block at once
+    data_block = list(sheet.iter_rows(min_row=start_row, max_row=end_row,
+                                      min_col=joint_col, max_col=inspection_end_col,
+                                      values_only=True))
+
+    # Column indices relative to the start of the data_block
+    joint_col_idx = 0  # joint_col (2) - min_col (2)
+    inspection_start_idx = inspection_start_col - joint_col  # 4 - 2 = 2
+    inspection_end_idx = inspection_end_col - joint_col  # 15 - 2 = 13
+
+    # Process each row from the in-memory data block
+    for row_data in data_block:
+        joint_val = row_data[joint_col_idx]
 
         if joint_val is not None:
             try:
                 joint_num = int(joint_val)
 
-                # Count numeric values in columns D to O
-                numeric_count = 0
-                for col in range(inspection_start_col, inspection_end_col + 1):
-                    cell_val = sheet.cell(row=row, column=col).value
+                # Slice the row data to get only inspection columns
+                inspection_values = row_data[inspection_start_idx: inspection_end_idx + 1]
 
-                    # Count only actual numeric values (not None, not empty string)
+                numeric_count = 0
+                for cell_val in inspection_values:
                     if cell_val is not None and cell_val != "" and isinstance(cell_val, (int, float)):
-                        # Count zero as a numeric value (you can change this if needed)
                         numeric_count += 1
 
-                # Calculate ratio using dynamic divisor
                 ratio = numeric_count / divisor
 
-                # Store ratio for this joint
                 if joint_num not in joint_ratios:
                     joint_ratios[joint_num] = []
                 joint_ratios[joint_num].append(ratio)
 
-                logger.debug(f"Joint {joint_num}, Row {row}: {numeric_count} numeric values, ratio = {ratio:.3f}")
+                logger.debug(f"Joint {joint_num}: {numeric_count} numeric values, ratio = {ratio:.3f}")
 
             except (ValueError, TypeError):
-                logger.warning(f"Invalid joint value at row {row}: {joint_val}")
+                logger.warning(f"Invalid joint value: {joint_val}")
                 continue
 
     # Calculate average ratio for each joint
@@ -570,7 +680,9 @@ def calculate_inspection_rate_ratio(sheet, data_area, nps_size):
 
     return joint_avg_ratios
 
-def write_minimum_thickness_to_sheet2(workbook, sheet1, sheet2, sheet1_data_area, sheet2_data_area, sheet1_header_area,
+
+def write_minimum_thickness_to_sheet2(workbook, sheet1, sheet2, sheet1_data_area, sheet2_data_area,
+                                      sheet1_header_area,
                                       report_type):
     """
     Write minimum thickness values from Sheet 1 to Sheet 2.
@@ -597,11 +709,14 @@ def write_minimum_thickness_to_sheet2(workbook, sheet1, sheet2, sheet1_data_area
     # Find joint column in Sheet 1 (usually column B)
     sheet1_joint_col = 2  # Column B
 
-    # Collect thickness data by joint from Sheet 1
+    # Collect thickness data by joint from Sheet 1 using batch read
+    s1_start_row, s1_end_row, _, _ = sheet1_data_area
+    joint_vals = get_column_values_batch(sheet1, sheet1_joint_col, s1_start_row, s1_end_row)
+    thickness_vals = get_column_values_batch(sheet1, thickness_col, s1_start_row, s1_end_row)
+
     joint_thickness_map = {}
-    for row in range(sheet1_data_area[0], sheet1_data_area[1] + 1):
-        joint_val = sheet1.cell(row=row, column=sheet1_joint_col).value
-        thickness_val = sheet1.cell(row=row, column=thickness_col).value
+    for i, joint_val in enumerate(joint_vals):
+        thickness_val = thickness_vals[i]
 
         if joint_val is not None and thickness_val is not None:
             # Convert to appropriate types
@@ -632,6 +747,10 @@ def write_minimum_thickness_to_sheet2(workbook, sheet1, sheet2, sheet1_data_area
 
     # Determine joint column in Sheet 2
     sheet2_joint_col = 1 if report_type == "v1" else 2  # Column A for v1, Column B for v2
+    s2_start_row, s2_end_row, _, _ = sheet2_data_area
+
+    # Batch read joint column from sheet 2
+    sheet2_joint_vals = get_column_values_batch(sheet2, sheet2_joint_col, s2_start_row, s2_end_row)
 
     # Determine the column to write thickness values (after data area end column)
     write_col = sheet2_data_area[3] + 1  # Next column after data area end
@@ -642,9 +761,8 @@ def write_minimum_thickness_to_sheet2(workbook, sheet1, sheet2, sheet1_data_area
 
     # Write minimum thickness values to Sheet 2
     written_count = 0
-    for row in range(sheet2_data_area[0], sheet2_data_area[1] + 1):
-        joint_val = sheet2.cell(row=row, column=sheet2_joint_col).value
-
+    for i, joint_val in enumerate(sheet2_joint_vals):
+        row = s2_start_row + i
         if joint_val is not None:
             try:
                 joint_num = int(joint_val)
@@ -686,6 +804,10 @@ def write_inspection_rate_ratio_to_sheet2(workbook, sheet1, sheet2, sheet1_data_
 
     # Determine joint column in Sheet 2
     sheet2_joint_col = 1 if report_type == "v1" else 2  # Column A for v1, Column B for v2
+    s2_start_row, s2_end_row, _, _ = sheet2_data_area
+
+    # Batch read joint column from sheet 2
+    sheet2_joint_vals = get_column_values_batch(sheet2, sheet2_joint_col, s2_start_row, s2_end_row)
 
     # Determine the column to write ratio values (after minimum thickness column)
     # Min thickness is at data_area_end + 1, so ratio goes at data_area_end + 2
@@ -697,9 +819,8 @@ def write_inspection_rate_ratio_to_sheet2(workbook, sheet1, sheet2, sheet1_data_
 
     # Write ratio values to Sheet 2
     written_count = 0
-    for row in range(sheet2_data_area[0], sheet2_data_area[1] + 1):
-        joint_val = sheet2.cell(row=row, column=sheet2_joint_col).value
-
+    for i, joint_val in enumerate(sheet2_joint_vals):
+        row = s2_start_row + i
         if joint_val is not None:
             try:
                 joint_num = int(joint_val)
@@ -729,19 +850,30 @@ def extract_from_sheet2_optimized(sheet: Worksheet, total_joint: Any, report_typ
         return {}
 
     header_area, data_area = areas
+    if report_type == "v2" and sheet.title == SHEET_2_NAME_V2:
+        from openpyxl.utils import column_index_from_string
+        remarks_col_idx = column_index_from_string("AA")
+        header_area = (header_area[0], header_area[1], header_area[2], remarks_col_idx)
+        data_area = (data_area[0], data_area[1], data_area[2], remarks_col_idx)
+        logger.info("Overriding Remarks column to AA for v2 General Visual sheet")
+
     logger.info(
         f"Header Area: {get_column_letter(header_area[2])}{header_area[0]}:{get_column_letter(header_area[3])}{header_area[1]}")
     logger.info(
         f"Data Area: {get_column_letter(data_area[2])}{data_area[0]}:{get_column_letter(data_area[3])}{data_area[1]}")
 
-    data = {
-        "Above Ground Position": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Above Ground"),
-        "Lay Down Position": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Lay Down"),
-        "Under Ground Position": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Under Ground"),
-        "Sleeve Condition": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Sleeve"),
-        "Clamp Condition": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Clamp"),
-        "Isolation Condition": find_check_mark_in_column_optimized(sheet, header_area, data_area, "Isolation"),
-    }
+    condition_keywords = [
+        "Above Ground", "Lay Down", "Under Ground", "Sleeve",
+        "Clamp", "Isolation"
+    ]
+
+    data = {}
+
+    for keyword in condition_keywords:
+        col_idx = find_column_by_keyword_optimized(sheet, header_area, keyword)
+        unique_vals = extract_unique_values_from_col_or_notfound(sheet, data_area, col_idx)
+        data[
+            f"{keyword} Position" if 'Ground' in keyword or 'Lay Down' in keyword else f"{keyword} Condition"] = unique_vals
 
     # Handle painting condition
     painting_col_idx = find_column_by_keyword_optimized(sheet, header_area, "Painting")
@@ -757,6 +889,7 @@ def extract_from_sheet2_optimized(sheet: Worksheet, total_joint: Any, report_typ
 def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
     """
     Processes a single Excel file to extract data without modifying the original file.
+    Handles unknown templates by recording them with minimal data.
     """
     filename = os.path.basename(file_path)
     logger.info(f"Extracting data from file: {filename}")
@@ -771,27 +904,32 @@ def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
         document_version = determine_document_version(workbook)
         combined_data["Document Version"] = document_version
 
-        report_type = None
+        # If the version is unknown, log it and return the basic data.
+        # This will result in a row with mostly empty values in the output.
+        if document_version == "unknown":
+            logger.warning(f"'{filename}' has an unknown template. Recording with version only.")
+            workbook.close()
+            return combined_data
 
-        # Rest of the existing code remains the same...
-        # Determine report type and get sheets
+        report_type = document_version  # Use the determined version
         sheet1, sheet2 = None, None
-        if SHEET_1_NAME_V1 in workbook.sheetnames or SHEET_1_NAME_V1_ALT in workbook.sheetnames:
-            report_type = "v1"
+
+        # Get sheets based on the determined version
+        if report_type == "v1":
             sheet1 = workbook[SHEET_1_NAME_V1] if SHEET_1_NAME_V1 in workbook.sheetnames else workbook[
                 SHEET_1_NAME_V1_ALT]
             if SHEET_2_NAME_V1 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V1]
-        elif SHEET_1_NAME_V2 in workbook.sheetnames:
-            report_type = "v2"
+        elif report_type == "v2":
             sheet1 = workbook[SHEET_1_NAME_V2]
             if SHEET_2_NAME_V2 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V2]
 
-        if not report_type:
-            logger.warning(f"Could not determine report type for {filename}")
+        if not sheet1:
+            logger.warning(f"Could not find primary data sheet for {filename} (Version: {report_type}). Treating as unknown.")
             workbook.close()
-            return {"File Name": filename, "Error": "Unknown report type"}
+            # Return basic data if the main sheet is missing
+            return {"File Name": filename, "Document Version": document_version}
 
         # Process Sheet 1
         data_from_s1 = extract_from_sheet1_optimized(sheet1, report_type)
@@ -818,7 +956,7 @@ def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
 def process_single_file_with_calculations_and_updates(file_path: str) -> Dict[str, Any]:
     """
     Processes a single Excel file, performs calculations (min thickness, inspection rate ratio),
-    and writes the results back to the original file.
+    and writes the results back to the original file. Skips files with unknown templates.
     """
     filename = os.path.basename(file_path)
     logger.info(f"Processing file for calculations and updates: {filename}")
@@ -827,27 +965,35 @@ def process_single_file_with_calculations_and_updates(file_path: str) -> Dict[st
         # Load workbook in write mode (not read_only)
         workbook = openpyxl.load_workbook(file_path, read_only=False, data_only=True)
 
+        # Determine document version first
+        document_version = determine_document_version(workbook)
+
+        # If the version is unknown, we cannot process it for updates.
+        if document_version == "unknown":
+            logger.warning(f"'{filename}' has an unknown template. Skipping calculations and updates.")
+            workbook.close()
+            # Return an error so it's logged correctly in the calling function.
+            return {"File Name": filename, "Error": "Unknown template; skipped update."}
+
         combined_data = {"File Name": filename}
-        report_type = None
+        report_type = document_version
+        sheet1, sheet2 = None, None
 
         # Determine report type and get sheets
-        sheet1, sheet2 = None, None
-        if SHEET_1_NAME_V1 in workbook.sheetnames or SHEET_1_NAME_V1_ALT in workbook.sheetnames:
-            report_type = "v1"
+        if report_type == "v1":
             sheet1 = workbook[SHEET_1_NAME_V1] if SHEET_1_NAME_V1 in workbook.sheetnames else workbook[
                 SHEET_1_NAME_V1_ALT]
             if SHEET_2_NAME_V1 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V1]
-        elif SHEET_1_NAME_V2 in workbook.sheetnames:
-            report_type = "v2"
+        elif report_type == "v2":
             sheet1 = workbook[SHEET_1_NAME_V2]
             if SHEET_2_NAME_V2 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V2]
 
-        if not report_type:
-            logger.warning(f"Could not determine report type for {filename}")
+        if not sheet1:
+            logger.warning(f"Could not find primary data sheet for {filename} (Version: {report_type}). Skipping calculations.")
             workbook.close()
-            return {"File Name": filename, "Error": "Unknown report type"}
+            return {"File Name": filename, "Error": "Could not find primary data sheet"}
 
         # Extract data from Sheet 1 (needed for total_joint and data_area)
         sheet1_header_area = find_area_by_remarks_optimized(sheet1)
@@ -977,7 +1123,8 @@ def run_extraction_only():
             "Pipe Material", "Nominal Thickness (in)", "Nominal Thickness (mm)",
             "Operating Pressure (psi)", "Operating Temperature (F)", "Service Fluid",
             "Flange Rating", "Line ID", "NPS (in)", "Total Joint",
-            "Minimum Thickness (mm)", "Joint of Minimum Thickness","Maximum Thickness (mm)","Joint of Maximum Thickness", "Remarks",
+            "Minimum Thickness (mm)", "Joint of Minimum Thickness", "Maximum Thickness (mm)",
+            "Joint of Maximum Thickness", "Max Thickness Pipe Joint", "Remarks",
             "Above Ground Position", "Lay Down Position", "Under Ground Position",
             "Painting Condition", "Sleeve Condition", "Clamp Condition",
             "Isolation Condition", "Remarks Visual", "Estimation Year Buil", "Pipe Segment"
@@ -1021,7 +1168,8 @@ def run_calculations_and_updates():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, DATA_FOLDER)
-    output_dir = os.path.join(script_dir, OUTPUT_FOLDER) # Output dir still used for logging, but no new summary file
+    output_dir = os.path.join(script_dir,
+                              OUTPUT_FOLDER)  # Output dir still used for logging, but no new summary file
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1056,8 +1204,10 @@ def run_calculations_and_updates():
     end_time = time.time()
     processing_time = end_time - start_time
 
-    logger.info(f"Finished processing {len(successful_updates)} files for calculations and updates in {processing_time:.2f} seconds.")
-    logger.info(f"Original files in '{DATA_FOLDER}' have been updated with minimum thickness values and inspection rate ratios.")
+    logger.info(
+        f"Finished processing {len(successful_updates)} files for calculations and updates in {processing_time:.2f} seconds.")
+    logger.info(
+        f"Original files in '{DATA_FOLDER}' have been updated with minimum thickness values and inspection rate ratios.")
 
 
 # Usage example:
@@ -1084,4 +1234,3 @@ if __name__ == "__main__":
     elif args.mode == 'calculate_and_update':
         logger.info("Running in 'calculate and update' mode. Original files will be modified.")
         run_calculations_and_updates()
-
