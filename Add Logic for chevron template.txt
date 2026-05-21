@@ -1,0 +1,95 @@
+If unknown template is found, check first whether inspection report is 'chevron' or not.
+
+If you find 'UTM Inspection Report' in header Area of sheet 1, then its 'chevron' template
+
+on chevron template
+
+Use first sheet as sheet 1
+1. on first sheet or sheet 1
+2. use same header area algorithm to determine header area
+	. some cell contain more than 'remarks' word like 'Remarks (Est Length:M)'
+
+3. In header area, find word (same as find 'remarks'. it may contain more than objective word.)
+	- Field / Area : take cell with next 3 column of it, if not found 4 column
+		- Date is in B5, take E5 or F5
+	- Pipeline Name: same as Field
+	- Pipe diameter: same as Field
+	- Fluid Services : same as Field
+	- Location : 	same as Field					
+	- PKM :		same as Field	
+4. Find cell contain
+	- Joint No	
+	- Spot No	
+	- Dia inch
+	- Min Thick	
+	- Max Thick	
+	- Joint Types
+	- Condition Found
+
+Data Area.
+	- first row is next row of 'remarks' cell.
+	- End Row. 
+		- In same column as 'Joint No', find cell contain 'SPOT'. the previous row of 'SPOT' is the end row.	
+		- e.g. SPOT is B236, 235 is end row.
+	- First column, make 'Joint No' as start column.
+	- END Column, Make 'remarks' as end column
+
+
+extract these data
+	- min value from 'Min Thick' column in data area
+	- Max value from 'Max Thick' column in data area
+	- unique list of 'Condition Found' column in data area
+	- unique list of 'REMARKS' column in data area
+	- unique list of 'Joint Types' column in data area
+	- In 'remarks' column, in end row + 1 extract these as (Length Of Inspection (m))
+
+
+in sheet 2, find sheet called 'Sumary scan'
+	in area A1:Z20. find these cell and extract next 3 column of it, if not found 4 column
+		e,g, found in A15, take value from D15 or E15
+
+		Date -> Inspection Date Finish
+		Field / Area 
+		Pipeline Name 
+		Pipe Diameter 
+		Services 
+		SOP No.
+		Area No
+		Material
+		Nominal Thickness
+		Temperature
+		Surface Condition
+
+if not found sheet called 'Sumary scan', find sheet called 'VISUAL' and do same extraction method as v1 or v2 document.
+- addition
+	- find 'Total Length (m)' in header area, take the value in next 4 column, if not found 5 column as Length Of Inspection (m)
+		e,g, Total Length (m) is at A10, take F10 as value of Length of Inspection (m)
+
+also please improve the logging.
+I want to know which file has warning or error more clearly.
+
+
+Header Mappings from Chevron to Output Template:
+
+Date → Should this go to ? yes
+Pipeline Name → Should this go to Line ID? yes
+Pipe diameter → Should this go to NPS (in)? yes
+Fluid Services → Should this go to Service Fluid? yes
+Field / Area → Where should this map? (e.g. Pipe Segment or a new column?) new column, remember all new column is placed in rightmost column (I dont want to break old template)
+Location → Where should this map? (e.g. a new Location column?) new column
+PKM → Where should this map? (e.g. a new PKM column?) new column
+Data Area Mappings:
+
+Min value from 'Min Thick' column → Should this go to Minimum Thickness (mm)? yes
+Max value from 'Max Thick' column → Should this go to Maximum Thickness (mm)? yes
+Unique list of 'Joint Types' column → Where should this map? (e.g. a new Joint Types column, or concatenated with Remarks?) new column
+Unique list of 'Condition Found' column → Where should this map? new column
+Unique list of 'REMARKS' column → Should this go to Remarks? yes
+Second Sheet:
+
+Does the Chevron template have a second sheet for visual inspection data, or are all visual checks (if any) integrated into the first sheet (e.g. 'ut thick')?
+
+chevron template second sheet is like equivalence of 'visual' sheet from v1 or v2. However in older document of chevron template, they use name 'Sumary Scan' not 'Visual' and they are very different in 'visual' sheet of v1 or v2. that's why I only extract little in 'Sumary Scan' sheet.
+
+Also improve the logging. In the end I want to know which document has error and the error details.
+Like summary.

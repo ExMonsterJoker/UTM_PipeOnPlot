@@ -10,10 +10,21 @@ import time
 from typing import Dict, List, Tuple, Optional, Any
 import logging
 import argparse  # Import argparse
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class LogCaptureHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+    
+    def emit(self, record):
+        if record.levelno >= logging.WARNING:
+            self.records.append(f"{record.levelname}: {record.getMessage()}")
 
 
 # --- Configuration ---
@@ -25,6 +36,7 @@ MAX_WORKERS = max(1, multiprocessing.cpu_count() - 1)
 SHEET_1_NAME_V1 = "TEMPLATE INSPEKSI"
 SHEET_1_NAME_V1_ALT = "TEMPALTE INSPEKSI"
 SHEET_2_NAME_V1 = "Visual"
+SHEET_2_NAME_V1_ALT = "Visual-01"
 
 SHEET_1_NAME_V2 = "UT Data"
 SHEET_2_NAME_V2 = "General Visual"
@@ -242,6 +254,139 @@ def find_data_area_sheet1_optimized(sheet: Worksheet, end_col_from_first_area: i
     return start_row, end_row, 2, end_col_from_first_area
 
 
+def find_area_by_remarks_chevron(sheet: Worksheet, filename: str) -> Optional[Tuple[int, int, int, int]]:
+    """Remarks finder for Chevron template, starting at Column A (1)."""
+    start_row, start_col = 2, 1
+    try:
+        search_end_col_idx = column_index_from_string(SEARCH_REMARKS_END_COL)
+    except Exception:
+        logger.error(f"[{filename}] Invalid column '{SEARCH_REMARKS_END_COL}' in config.")
+        return None
+
+    search_area = (start_row, SEARCH_REMARKS_END_ROW, start_col, search_end_col_idx)
+    area_values = get_area_values_batch(sheet, search_area)
+
+    for (row, col), value in area_values.items():
+        if value and isinstance(value, str) and "REMARKS".lower() in value.lower():
+            return start_row, row, start_col, col
+
+    logger.error(f"[{filename}] Could not find 'REMARKS' cell in range A2:{SEARCH_REMARKS_END_COL}{SEARCH_REMARKS_END_ROW}")
+    return None
+
+
+def search_for_value_chevron_generic(sheet: Worksheet, area: Tuple[int, int, int, int], keywords: List[str], max_offset: int = 5) -> str:
+    """Generic header value scanner for Chevron templates with bounded offset."""
+    if not area:
+        return "Not Found"
+    area_values = get_area_values_batch(sheet, area)
+    keywords_lower = [k.lower() for k in keywords]
+    
+    # 1. First find the keyword cell
+    for (row, col), value in area_values.items():
+        if value and isinstance(value, str):
+            value_lower = value.lower()
+            for keyword in keywords_lower:
+                if keyword in value_lower:
+                    # 2. Look to the right of the cell, prioritizing offset 3, then 4
+                    for offset in [3, 4]:
+                        target_col = col + offset
+                        if target_col <= sheet.max_column:
+                            cell_val = sheet.cell(row=row, column=target_col).value
+                            if cell_val is not None:
+                                cell_str = str(cell_val).strip()
+                                if cell_str not in ["", ":", "="]:
+                                    return cell_val
+                    
+                    # 3. Fallback: If the cell itself contains a colon, check if there is a value inside the cell itself
+                    if ":" in value:
+                        parts = value.split(":", 1)
+                        candidate = parts[1].strip()
+                        if candidate and candidate.lower() not in ["nps", "inch", "mm"]:
+                            return candidate
+                    
+                    # 4. Fallback: Look to other offsets
+                    for offset in [1, 2, 5]:
+                        target_col = col + offset
+                        if target_col <= sheet.max_column:
+                            cell_val = sheet.cell(row=row, column=target_col).value
+                            if cell_val is not None:
+                                cell_str = str(cell_val).strip()
+                                if cell_str not in ["", ":", "="]:
+                                    return cell_val
+                    return "Not Found"
+    return "Not Found"
+
+
+def search_for_value_chevron(sheet: Worksheet, area: Tuple[int, int, int, int], keywords: List[str], max_offset: int = 5) -> str:
+    """Fallback / compatibility searcher using the generic scanner."""
+    return search_for_value_chevron_generic(sheet, area, keywords, max_offset)
+
+
+def find_data_area_chevron(sheet: Worksheet, header_area: Tuple[int, int, int, int], filename: str) -> Optional[Tuple[int, int, int, int]]:
+    """Determine data area for Chevron template."""
+    if not header_area:
+        return None
+    
+    start_r, end_r, start_c, end_c = header_area
+    # Data starts at the row immediately following the remarks row
+    start_row = end_r + 1
+    
+    # Locate the "Joint No" column
+    joint_col = None
+    for r in range(1, start_row):
+        for c in range(1, sheet.max_column + 1):
+            val = sheet.cell(row=r, column=c).value
+            if val and isinstance(val, str) and "joint no" in val.lower():
+                joint_col = c
+                break
+        if joint_col:
+            break
+            
+    if not joint_col:
+        logger.warning(f"[{filename}] Could not find column 'Joint No'. Using column B as fallback.")
+        joint_col = 2
+        
+    # Locate the row where "SPOT" is present in the joint_col
+    end_row = None
+    col_values = get_column_values_batch(sheet, joint_col, start_row, sheet.max_row)
+    for i, cell_val in enumerate(col_values):
+        if cell_val and isinstance(cell_val, str) and "spot" in cell_val.lower():
+            end_row = start_row + i - 1
+            break
+            
+    if not end_row:
+        logger.warning(f"[{filename}] Could not find 'SPOT' cell in 'Joint No' column. Using sheet max_row.")
+        end_row = sheet.max_row
+        
+    return start_row, end_row, joint_col, end_c
+
+
+def extract_min_thick_chevron(sheet: Worksheet, data_area: Tuple[int, int, int, int], col_idx: Optional[int]) -> Any:
+    """Extract minimum thickness for Chevron template, excluding zero/empty values."""
+    if not col_idx:
+        return "Not Found"
+    start_row, end_row, _, _ = data_area
+    vals = get_column_values_batch(sheet, col_idx, start_row, end_row)
+    numeric_vals = []
+    for v in vals:
+        if isinstance(v, (int, float)) and v > 0:
+            numeric_vals.append(v)
+    return min(numeric_vals) if numeric_vals else "Not Found"
+
+
+def extract_max_thick_chevron(sheet: Worksheet, data_area: Tuple[int, int, int, int], col_idx: Optional[int]) -> Any:
+    """Extract maximum thickness for Chevron template, excluding zero/empty values."""
+    if not col_idx:
+        return "Not Found"
+    start_row, end_row, _, _ = data_area
+    vals = get_column_values_batch(sheet, col_idx, start_row, end_row)
+    numeric_vals = []
+    for v in vals:
+        if isinstance(v, (int, float)) and v > 0:
+            numeric_vals.append(v)
+    return max(numeric_vals) if numeric_vals else "Not Found"
+
+
 def find_total_joint_from_data_area(sheet: Worksheet, start_row: int, end_row: int) -> Any:
     """Find the biggest number in Column B within the data area range."""
     max_number = None
@@ -260,7 +405,20 @@ def find_areas_visual_optimized(sheet: Worksheet, report_type: str, filename: st
     """Optimized visual area finder, using 'inspector' to determine the end row."""
     try:
         start_col_data = 2 if report_type == "v2" else 1
-        remarks_col_idx = column_index_from_string("AA")
+
+        # Dynamically find the remarks column index
+        remarks_col_idx = None
+        for r in range(1, 15):
+            for c in range(1, min(40, sheet.max_column + 1)):
+                val = sheet.cell(row=r, column=c).value
+                if val and isinstance(val, str) and "remarks" in val.lower():
+                    remarks_col_idx = c
+                    break
+            if remarks_col_idx:
+                break
+        
+        if not remarks_col_idx:
+            remarks_col_idx = column_index_from_string("AA")
 
         data_start_row = None
         col_start_values = get_column_values_batch(sheet, start_col_data, 1, min(sheet.max_row, 100))
@@ -313,15 +471,30 @@ def determine_document_version(workbook, filename: str, sheet1_name=None) -> str
     """Determine the document version based on sheet names and structure."""
     try:
         sheet_names = workbook.sheetnames
-        v1_indicators = [SHEET_1_NAME_V1 in sheet_names, SHEET_1_NAME_V1_ALT in sheet_names, SHEET_2_NAME_V1 in sheet_names]
+        v1_indicators = [SHEET_1_NAME_V1 in sheet_names, SHEET_1_NAME_V1_ALT in sheet_names, SHEET_2_NAME_V1 in sheet_names, SHEET_2_NAME_V1_ALT in sheet_names]
         v2_indicators = [SHEET_1_NAME_V2 in sheet_names, SHEET_2_NAME_V2 in sheet_names]
 
         if any(v1_indicators):
             return "v1"
         elif any(v2_indicators):
             return "v2"
-        else:
-            return "unknown"
+        
+        # Check for chevron template
+        if sheet_names:
+            first_sheet = workbook.worksheets[0]
+            is_chevron = False
+            # Search first 15 rows and 26 columns of the first sheet for the keyword
+            for row in first_sheet.iter_rows(min_row=1, max_row=15, min_col=1, max_col=26, values_only=True):
+                for cell_val in row:
+                    if cell_val and isinstance(cell_val, str) and "UTM Inspection Report".lower() in cell_val.lower():
+                        is_chevron = True
+                        break
+                if is_chevron:
+                    break
+            if is_chevron:
+                return "chevron"
+
+        return "unknown"
 
     except Exception as e:
         logger.warning(f"[{filename}] Error determining document version: {e}")
@@ -417,6 +590,105 @@ def extract_max_thickness_pipe_joint_optimized(sheet: Worksheet, data_area: Tupl
                 if max_thickness is None or thickness_val > max_thickness:
                     max_thickness = thickness_val
     return max_thickness if max_thickness is not None else "="
+
+
+def extract_from_chevron_optimized(sheet: Worksheet, filename: str) -> Tuple[Dict[str, Any], Optional[Tuple[int, int, int, int]]]:
+    """Optimized extraction function for Chevron template."""
+    logger.info(f"[{filename}] Processing Chevron sheet: {sheet.title}")
+
+    header_area = find_area_by_remarks_chevron(sheet, filename)
+    if not header_area:
+        return {}, None
+
+    start_r, end_r, start_c, end_c = header_area
+    logger.info(f"[{filename}] Chevron Header Area: {get_column_letter(start_c)}{start_r}:{get_column_letter(end_c)}{end_r}")
+
+    # Extract header values
+    date_val = search_for_value_chevron_generic(sheet, header_area, ["Date"])
+    field_val = search_for_value_chevron_generic(sheet, header_area, ["Field / Area", "Field", "Area"])
+    pipeline_val = search_for_value_chevron_generic(sheet, header_area, ["Pipeline Name", "Pipeline", "Equipment Description"])
+    location_val = search_for_value_chevron_generic(sheet, header_area, ["Location"])
+    pkm_val = search_for_value_chevron_generic(sheet, header_area, ["PKM"])
+
+    diameter_val = search_for_value_chevron_generic(sheet, header_area, ["Pipe diameter", "diameter"])
+    fluid_val = search_for_value_chevron_generic(sheet, header_area, ["Fluid Services", "Fluid", "Services"])
+    
+    # Fallback to special logic if fluid_val or diameter_val is not found
+    if diameter_val == "Not Found" or fluid_val == "Not Found":
+        d_row, d_col = None, None
+        area_vals = get_area_values_batch(sheet, header_area)
+        for (row, col), val in area_vals.items():
+            if val and isinstance(val, str) and any(kw in val.lower() for kw in ["pipe diameter", "diameter"]):
+                d_row, d_col = row, col
+                break
+        
+        if d_row is not None:
+            if diameter_val == "Not Found":
+                for offset in range(1, 13):
+                    cell_val = sheet.cell(row=d_row, column=d_col + offset).value
+                    if cell_val is not None:
+                        cell_str = str(cell_val).strip()
+                        if cell_str not in ["", ":", "="] and re.search(r'\d', cell_str):
+                            diameter_val = cell_val
+                            break
+            
+            if fluid_val == "Not Found":
+                for offset in range(1, 13):
+                    cell_val = sheet.cell(row=d_row, column=d_col + offset).value
+                    if cell_val is not None:
+                        cell_str = str(cell_val).strip()
+                        if cell_str not in ["", ":", "="] and cell_str != str(diameter_val):
+                            fluid_val = cell_val
+                            break
+
+    data = {
+        "Inspection Date Finish": date_val,
+        "Line ID": pipeline_val,
+        "NPS (in)": diameter_val,
+        "Service Fluid": fluid_val,
+        "Field / Area": field_val,
+        "Location": location_val,
+        "PKM": pkm_val
+    }
+
+    data_area = find_data_area_chevron(sheet, header_area, filename)
+    if data_area:
+        logger.info(
+            f"[{filename}] Chevron Data Area: {get_column_letter(data_area[2])}{data_area[0]}:{get_column_letter(data_area[3])}{data_area[1]}")
+
+        start_row, end_row, joint_col, remarks_col = data_area
+        
+        # Determine total joint
+        total_joint = find_total_joint_from_data_area(sheet, start_row, end_row)
+        data["Total Joint"] = total_joint
+
+        # Define data header area for column searches
+        data_header_area = (1, start_row - 1, joint_col, remarks_col)
+
+        # Find columns
+        min_thick_col = find_column_by_keyword_optimized(sheet, data_header_area, "Min Thick", filename)
+        max_thick_col = find_column_by_keyword_optimized(sheet, data_header_area, "Max Thick", filename)
+        joint_types_col = find_column_by_keyword_optimized(sheet, data_header_area, "Joint Types", filename)
+        condition_found_col = find_column_by_keyword_optimized(sheet, data_header_area, "Condition Found", filename)
+
+        # Extract values
+        data["Minimum Thickness (mm)"] = extract_min_thick_chevron(sheet, data_area, min_thick_col)
+        data["Maximum Thickness (mm)"] = extract_max_thick_chevron(sheet, data_area, max_thick_col)
+        
+        data["Joint Types"] = extract_unique_values_from_col_optimized(sheet, data_area, joint_types_col)
+        data["Condition Found"] = extract_unique_values_from_col_optimized(sheet, data_area, condition_found_col)
+        data["Remarks"] = extract_unique_values_from_col_optimized(sheet, data_area, remarks_col)
+
+        # In 'remarks' column, in end row + 1 extract these as (Length Of Inspection (m))
+        length_val = "Not Found"
+        if end_row and remarks_col and end_row + 1 <= sheet.max_row:
+            fallback_val = sheet.cell(row=end_row + 1, column=remarks_col).value
+            if fallback_val is not None and str(fallback_val).strip() != "":
+                length_val = fallback_val
+
+        data["Length Of Inspection (m)"] = length_val if (length_val is not None and str(length_val).strip() != "") else "Not Found"
+
+    return data, data_area
 
 
 def extract_from_sheet1_optimized(sheet: Worksheet, report_type: str, filename: str) -> Tuple[Dict[str, Any], Optional[Tuple[int, int, int, int]]]:
@@ -668,16 +940,141 @@ def extract_from_sheet2_optimized(sheet: Worksheet, report_type: str, filename: 
         unique_vals = extract_unique_values_from_col_or_notfound(sheet, data_area, col_idx)
         data[f"{keyword} Position" if 'Ground' in keyword or 'Lay Down' in keyword else f"{keyword} Condition"] = unique_vals
 
+    # Consolidate visual inspection columns "Casing", "Condom", and "Double Pipe"
+    casing_vals = set()
+    found_cols = []
+    # Search all columns in the header area
+    for col_idx in range(header_area[2], header_area[3] + 1):
+        for r in range(header_area[0], header_area[1] + 1):
+            val = sheet.cell(row=r, column=col_idx).value
+            if val and isinstance(val, str):
+                val_lower = val.lower()
+                if "casing" in val_lower or "condom" in val_lower or "double pipe" in val_lower:
+                    if col_idx not in found_cols:
+                        found_cols.append(col_idx)
+                        break
+                        
+    for col_idx in found_cols:
+        col_vals = extract_unique_values_from_col_or_notfound(sheet, data_area, col_idx)
+        if col_vals and col_vals != "Not Found":
+            for v in col_vals.split(", "):
+                if v.strip():
+                    casing_vals.add(v.strip())
+                    
+    data["Casing Condition"] = ", ".join(sorted(list(casing_vals))) if casing_vals else "Not Found"
+    data["Condom Condition"] = "Not Found"
+    data["Double Pipe Condition"] = "Not Found"
+
     painting_col_idx = find_column_by_keyword_optimized(sheet, header_area, "Painting", filename)
     data["Painting Condition"] = extract_unique_values_from_col_optimized(sheet, data_area, painting_col_idx)
 
     remarks_col_idx = header_area[3]
     data["Remarks Visual"] = extract_unique_values_from_col_optimized(sheet, data_area, remarks_col_idx)
 
+    if report_type == "chevron":
+        length_val = "Not Found"
+        area_vals = get_area_values_batch(sheet, header_area)
+        for (row, col), val in area_vals.items():
+            if val and isinstance(val, str) and "total length (m)" in val.lower():
+                # Check next 5 column (col + 5)
+                c5_val = sheet.cell(row=row, column=col + 5).value if col + 5 <= sheet.max_column else None
+                if c5_val is not None and str(c5_val).strip() not in ["", ":", "="]:
+                    length_val = c5_val
+                    break
+                # Check next 4 column (col + 4)
+                c4_val = sheet.cell(row=row, column=col + 4).value if col + 4 <= sheet.max_column else None
+                if c4_val is not None and str(c4_val).strip() not in ["", ":", "="]:
+                    length_val = c4_val
+                    break
+        if length_val != "Not Found" and str(length_val).strip() != "":
+            data["Length Of Inspection (m)"] = length_val
+
+    return data
+
+
+def extract_from_sheet2_chevron_summary(sheet: Worksheet, filename: str) -> Dict[str, Any]:
+    """Extract metadata from Chevron Summary Scan sheet."""
+    logger.info(f"[{filename}] Processing Chevron Sumary Scan sheet: {sheet.title}")
+    # Let's search in the first 20 rows and 26 columns (A1:Z20)
+    search_area = (1, 20, 1, min(26, sheet.max_column))
+    
+    sop_no = search_for_value_chevron_generic(sheet, search_area, ["SOP No."])
+    area_no = search_for_value_chevron_generic(sheet, search_area, ["Area No"])
+    surface_cond = search_for_value_chevron_generic(sheet, search_area, ["Surface Condition"])
+    
+    # Also extract other headers in case sheet 1 has missing info
+    date_val = search_for_value_chevron_generic(sheet, search_area, ["Date"])
+    field_val = search_for_value_chevron_generic(sheet, search_area, ["Field / Area", "Field", "Area"])
+    pipeline_val = search_for_value_chevron_generic(sheet, search_area, ["Pipeline Name", "Pipeline"])
+    diameter_val = search_for_value_chevron_generic(sheet, search_area, ["Pipe Diameter"])
+    services_val = search_for_value_chevron_generic(sheet, search_area, ["Services", "Fluid Services"])
+    
+    data = {
+        "SOP No.": sop_no,
+        "Area No": area_no,
+        "Surface Condition": surface_cond,
+        "Inspection Date Finish": date_val,
+        "Field / Area": field_val,
+        "Line ID": pipeline_val,
+        "NPS (in)": diameter_val,
+        "Service Fluid": services_val
+    }
+    
+    # Additional Chevron Summary Scan fields
+    material_val = search_for_value_chevron_generic(sheet, search_area, ["Material"])
+    nominal_thick_val = search_for_value_chevron_generic(sheet, search_area, ["Nominal Thickness"])
+    temp_val = search_for_value_chevron_generic(sheet, search_area, ["Temperature"])
+    
+    nom_thick_in = "Not Found"
+    nom_thick_mm = "Not Found"
+    if nominal_thick_val != "Not Found":
+        val_str = str(nominal_thick_val).lower()
+        if "mm" in val_str:
+            nom_thick_mm = nominal_thick_val
+        elif "in" in val_str or '"' in val_str:
+            nom_thick_in = nominal_thick_val
+        else:
+            try:
+                num_match = re.search(r'[-+]?\d*\.\d+|\d+', val_str)
+                if num_match:
+                    num_val = float(num_match.group())
+                    if num_val < 2.0:
+                        nom_thick_in = nominal_thick_val
+                    else:
+                        nom_thick_mm = nominal_thick_val
+                else:
+                    nom_thick_in = nominal_thick_val
+            except ValueError:
+                nom_thick_in = nominal_thick_val
+                
+    data.update({
+        "Pipe Material": material_val,
+        "Nominal Thickness (in)": nom_thick_in,
+        "Nominal Thickness (mm)": nom_thick_mm,
+        "Operating Temperature (F)": temp_val
+    })
+    
     return data
 
 
 def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
+    """Processes a single Excel file to extract data without modifying the original file."""
+    capture_handler = LogCaptureHandler()
+    logger.addHandler(capture_handler)
+    try:
+        res = _inner_process_single_file_extraction_only(file_path)
+        if isinstance(res, dict):
+            res["_logs"] = capture_handler.records
+        return res
+    except Exception as e:
+        filename = os.path.basename(file_path)
+        logger.error(f"[{filename}] Exception in outer wrapper: {e}")
+        return {"File Name": filename, "Error": str(e), "_logs": capture_handler.records}
+    finally:
+        logger.removeHandler(capture_handler)
+
+
+def _inner_process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
     """Processes a single Excel file to extract data without modifying the original file."""
     filename = os.path.basename(file_path)
     logger.info(f"[{filename}] Extracting data from file")
@@ -700,24 +1097,54 @@ def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
             sheet1 = workbook[SHEET_1_NAME_V1] if SHEET_1_NAME_V1 in workbook.sheetnames else workbook[SHEET_1_NAME_V1_ALT]
             if SHEET_2_NAME_V1 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V1]
+            elif SHEET_2_NAME_V1_ALT in workbook.sheetnames:
+                sheet2 = workbook[SHEET_2_NAME_V1_ALT]
         elif report_type == "v2":
             sheet1 = workbook[SHEET_1_NAME_V2]
             if SHEET_2_NAME_V2 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V2]
+        elif report_type == "chevron":
+            sheet1 = workbook.worksheets[0]
+            for name in workbook.sheetnames:
+                if "sumary scan" in name.lower() or "visual" in name.lower():
+                    sheet2 = workbook[name]
+                    break
 
         if not sheet1:
             logger.warning(f"[{filename}] Could not find primary data sheet (Version: {report_type}). Treating as unknown.")
             workbook.close()
             return {"File Name": filename, "Document Version": document_version}
 
-        data_from_s1, _ = extract_from_sheet1_optimized(sheet1, report_type, filename)
-        combined_data.update(data_from_s1)
-
-        if sheet2:
-            data_from_s2 = extract_from_sheet2_optimized(sheet2, report_type, filename)
-            combined_data.update(data_from_s2)
+        if report_type == "chevron":
+            data_from_s1, _ = extract_from_chevron_optimized(sheet1, filename)
+            combined_data.update(data_from_s1)
+            
+            if sheet2:
+                if "sumary scan" in sheet2.title.lower():
+                    data_from_s2 = extract_from_sheet2_chevron_summary(sheet2, filename)
+                    # Safe dictionary merge: prevent "Not Found" or empty values from sheet 2
+                    # overwriting valid values from sheet 1.
+                    for k, v in data_from_s2.items():
+                        if k in combined_data:
+                            s1_val = str(combined_data[k]).strip()
+                            s2_val = str(v).strip()
+                            if (s1_val == "" or s1_val == "Not Found") and s2_val != "" and s2_val != "Not Found":
+                                combined_data[k] = v
+                        else:
+                            combined_data[k] = v
+                else: # "visual"
+                    data_from_s2 = extract_from_sheet2_optimized(sheet2, report_type, filename)
+                    combined_data.update(data_from_s2)
+            else:
+                logger.warning(f"[{filename}] Sheet 2 not found, skipping visual/summary data extraction.")
         else:
-            logger.warning(f"[{filename}] Sheet 2 not found, skipping visual data extraction.")
+            data_from_s1, _ = extract_from_sheet1_optimized(sheet1, report_type, filename)
+            combined_data.update(data_from_s1)
+            if sheet2:
+                data_from_s2 = extract_from_sheet2_optimized(sheet2, report_type, filename)
+                combined_data.update(data_from_s2)
+            else:
+                logger.warning(f"[{filename}] Sheet 2 not found, skipping visual data extraction.")
 
         workbook.close()
         return combined_data
@@ -729,12 +1156,34 @@ def process_single_file_extraction_only(file_path: str) -> Dict[str, Any]:
 
 def process_single_file_with_calculations_and_updates(file_path: str) -> Dict[str, Any]:
     """Processes a single Excel file, performs calculations, and writes results back to the original file."""
+    capture_handler = LogCaptureHandler()
+    logger.addHandler(capture_handler)
+    try:
+        res = _inner_process_single_file_with_calculations_and_updates(file_path)
+        if isinstance(res, dict):
+            res["_logs"] = capture_handler.records
+        return res
+    except Exception as e:
+        filename = os.path.basename(file_path)
+        logger.error(f"[{filename}] Exception in outer wrapper: {e}")
+        return {"File Name": filename, "Error": str(e), "_logs": capture_handler.records}
+    finally:
+        logger.removeHandler(capture_handler)
+
+
+def _inner_process_single_file_with_calculations_and_updates(file_path: str) -> Dict[str, Any]:
+    """Processes a single Excel file, performs calculations, and writes results back to the original file."""
     filename = os.path.basename(file_path)
     logger.info(f"[{filename}] Processing file for calculations and updates")
 
     try:
         workbook = openpyxl.load_workbook(file_path, read_only=False, data_only=True)
         document_version = determine_document_version(workbook, filename)
+
+        if document_version == "chevron":
+            logger.info(f"[{filename}] is a Chevron template. Skipping calculations and updates.")
+            workbook.close()
+            return {"File Name": filename, "Status": "Skipped (Chevron template)"}
 
         if document_version == "unknown":
             logger.warning(f"[{filename}] has an unknown template. Skipping calculations and updates.")
@@ -749,6 +1198,8 @@ def process_single_file_with_calculations_and_updates(file_path: str) -> Dict[st
             sheet1 = workbook[SHEET_1_NAME_V1] if SHEET_1_NAME_V1 in workbook.sheetnames else workbook[SHEET_1_NAME_V1_ALT]
             if SHEET_2_NAME_V1 in workbook.sheetnames:
                 sheet2 = workbook[SHEET_2_NAME_V1]
+            elif SHEET_2_NAME_V1_ALT in workbook.sheetnames:
+                sheet2 = workbook[SHEET_2_NAME_V1_ALT]
         elif report_type == "v2":
             sheet1 = workbook[SHEET_1_NAME_V2]
             if SHEET_2_NAME_V2 in workbook.sheetnames:
@@ -857,10 +1308,34 @@ def run_extraction_only():
     valid_results = [r for r in all_results if "Error" not in r]
     error_results = [r for r in all_results if "Error" in r]
 
-    if error_results:
-        logger.warning(f"{len(error_results)} files had errors during extraction:")
-        for error_result in error_results:
-            logger.warning(f"  - {error_result['File Name']}: {error_result.get('Error', 'Unknown error')}")
+    files_with_warnings_or_errors = []
+    for r in all_results:
+        file_logs = r.get("_logs", [])
+        warn_err_logs = [log for log in file_logs if log.startswith("WARNING") or log.startswith("ERROR")]
+        if warn_err_logs or "Error" in r:
+            files_with_warnings_or_errors.append((r.get("File Name", "Unknown"), warn_err_logs, r.get("Error")))
+
+    logger.info("=" * 60)
+    logger.info("                     EXTRACTION SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"  Total files processed: {len(all_results)}")
+    logger.info(f"  Successfully extracted: {len(valid_results)}")
+    logger.info(f"  Errors/Failures: {len(error_results)}")
+    logger.info("-" * 60)
+    
+    if files_with_warnings_or_errors:
+        logger.info("  DETAILS OF FILES WITH WARNINGS OR ERRORS:")
+        for fname, logs, err in files_with_warnings_or_errors:
+            logger.info(f"  • {fname}:")
+            if err:
+                logger.info(f"      [ERROR] {err}")
+            for log in logs:
+                clean_log = re.sub(r'^(WARNING|ERROR):\s*', '', log)
+                log_type = "WARNING" if log.startswith("WARNING") else "ERROR"
+                logger.info(f"      [{log_type}] {clean_log}")
+    else:
+        logger.info("  All files processed successfully with no warnings or errors!")
+    logger.info("=" * 60)
 
     if valid_results:
         logger.info("Creating output Excel file with extracted data...")
@@ -873,7 +1348,9 @@ def run_extraction_only():
             "Joint of Maximum Thickness", "Max Thickness Pipe Joint", "Remarks",
             "Above Ground Position", "Lay Down Position", "Under Ground Position",
             "Painting Condition", "Sleeve Condition", "Clamp Condition",
-            "Isolation Condition", "Remarks Visual", "Estimation Year Buil", "Pipe Segment"
+            "Isolation Condition", "Casing Condition", "Condom Condition",
+            "Double Pipe Condition", "Remarks Visual", "Estimation Year Buil", "Pipe Segment",
+            "Field / Area", "Location", "PKM", "Joint Types", "Condition Found", "SOP No.", "Area No", "Surface Condition"
         ]
 
         output_workbook = openpyxl.Workbook()
@@ -918,18 +1395,56 @@ def run_calculations_and_updates():
     logger.info(f"Found {len(excel_files)} Excel files to process for calculations and updates.")
     all_results = process_files_parallel(excel_files, process_single_file_with_calculations_and_updates)
 
-    successful_updates = [r for r in all_results if "Error" not in r]
-    failed_updates = [r for r in all_results if "Error" in r]
+    successful_updates = [r for r in all_results if "Error" not in r and r.get("Status") != "Skipped (Chevron template)"]
+    skipped_updates = [r for r in all_results if r.get("Status") == "Skipped (Chevron template)" or ("Error" in r and "skipped" in str(r.get("Error")).lower())]
+    failed_updates = [r for r in all_results if "Error" in r and "skipped" not in str(r.get("Error")).lower()]
 
-    if failed_updates:
-        logger.warning(f"{len(failed_updates)} files had errors during calculation/update:")
-        for error_result in failed_updates:
-            logger.warning(f"  - {error_result['File Name']}: {error_result.get('Error', 'Unknown error')}")
+    files_with_warnings_or_errors = []
+    for r in all_results:
+        file_logs = r.get("_logs", [])
+        warn_err_logs = [log for log in file_logs if log.startswith("WARNING") or log.startswith("ERROR")]
+        if warn_err_logs or "Error" in r:
+            files_with_warnings_or_errors.append((r.get("File Name", "Unknown"), warn_err_logs, r.get("Error")))
+
+    logger.info("=" * 60)
+    logger.info("             CALCULATIONS AND UPDATES SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"  Total files processed: {len(all_results)}")
+    logger.info(f"  Successfully updated: {len(successful_updates)}")
+    logger.info(f"  Skipped (Chevron/Unknown): {len(skipped_updates)}")
+    logger.info(f"  Errors/Failures: {len(failed_updates)}")
+    logger.info("-" * 60)
+    
+    if skipped_updates:
+        logger.info("  SKIPPED FILES:")
+        for r in skipped_updates:
+            reason = r.get("Status") or r.get("Error")
+            logger.info(f"    • {r['File Name']}: {reason}")
+        logger.info("-" * 60)
+
+    actual_warn_errs = []
+    for fname, logs, err in files_with_warnings_or_errors:
+        if err and "skipped" in str(err).lower():
+            continue
+        if logs or err:
+            actual_warn_errs.append((fname, logs, err))
+
+    if actual_warn_errs:
+        logger.info("  DETAILS OF FILES WITH WARNINGS OR ERRORS:")
+        for fname, logs, err in actual_warn_errs:
+            logger.info(f"  • {fname}:")
+            if err:
+                logger.info(f"      [ERROR] {err}")
+            for log in logs:
+                clean_log = re.sub(r'^(WARNING|ERROR):\s*', '', log)
+                log_type = "WARNING" if log.startswith("WARNING") else "ERROR"
+                logger.info(f"      [{log_type}] {clean_log}")
+    else:
+        logger.info("  All updates/calculations finished with no warnings or errors!")
+    logger.info("=" * 60)
 
     end_time = time.time()
-    logger.info(
-        f"Finished processing {len(successful_updates)} files for calculations and updates in {end_time - start_time:.2f} seconds.")
-    logger.info(f"Original files in '{DATA_FOLDER}' have been updated.")
+    logger.info(f"Finished processing calculations and updates in {end_time - start_time:.2f} seconds.")
 
 
 if __name__ == "__main__":
